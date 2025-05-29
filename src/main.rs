@@ -463,10 +463,10 @@ async fn handle_client(
                                         hex::encode(nonce_array), // Кодируем массив nonce в hex
                                         hex::encode(ciphertext) // Кодируем зашифрованный текст в hex
                                     );
-                                    let private_msg_echo = format!("[ЛС для {}]: {}\n", with_nick.magenta(), msg_trimmed);
-
+                                    // ИСПРАВЛЕНИЕ: Удаляем эту строку, чтобы не было дублирования сообщения у отправителя
+                                    // let private_msg_echo = format!("[ЛС для {}]: {}\n", with_nick.magenta(), msg_trimmed);
                                     if send_to_user(&connected_users_read, with_nick, encrypted_msg).await.is_ok() {
-                                        current_writer_guard.write_all(private_msg_echo.as_bytes()).await?;
+                                        // current_writer_guard.write_all(private_msg_echo.as_bytes()).await?; // Эту строку мы удалили
                                     } else {
                                         current_writer_guard.write_all(format!("Не удалось отправить сообщение '{}'. Возможно, пользователь отключился. Вы возвращены в общий чат.\n", with_nick).as_bytes()).await?;
                                         *state_guard = ClientState::PublicChat; // Возврат в общий чат
@@ -490,7 +490,8 @@ async fn handle_client(
                                     // Здесь старые ЛС не шифруются, т.к. нет общего ключа
                                     let full_msg = format!("{} {}: {}\n", "Вам".cyan(), nickname_read, message_content);
                                     if send_to_user(&connected_users_read, recipient, full_msg).await.is_ok() {
-                                        current_writer_guard.write_all(format!("[ЛС для {}]: {}\n", recipient, message_content).as_bytes()).await?;
+                                        // ИСПРАВЛЕНИЕ: Удаляем эту строку, чтобы не было дублирования сообщения у отправителя
+                                        // current_writer_guard.write_all(format!("[ЛС для {}]: {}\n", recipient, message_content).as_bytes()).await?;
                                     } else {
                                         current_writer_guard.write_all(format!("{} Пользователь '{}' не найден или не в сети.\n", "Ошибка:".red(), recipient).as_bytes()).await?;
                                     }

@@ -1,0 +1,13 @@
+[package]
+name = "kursovik"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+colored = "2"
+aes-gcm = "0.10" #шифрование
+rand = "0.8"
+hex = "0.4" # для кодирования строк
+chrono = "0.4" # для логирования(дата и время)
+once_cell = "1.19" # ленивое объявление глобальной переменной

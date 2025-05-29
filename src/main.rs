@@ -11,6 +11,8 @@ use aes_gcm::{Aes256Gcm, Nonce}; // для шифрования AES-GCM
 use aes_gcm::aead::{Aead, KeyInit}; // для трейтов Aead и KeyInit
 use rand::{rngs::OsRng, RngCore}; // для генерации случайных чисел (шифрование) (nonce, shared key)
 use hex; // для кодирования/декодирования в/из hex-строк
+use chrono::Local; // Для получения текущего времени и даты
+use once_cell::sync::Lazy; // Для ленивой инициализации глобальной переменной
 
 // Тип для отправки сообщений между задачами (UnboundedSender)
 type Tx = mpsc::UnboundedSender<String>;
@@ -27,6 +29,37 @@ enum ClientState {
     InPrivateChat { with_nick: String, shared_key: Vec<u8> },
 }
 
+// Глобальная лениво инициализируемая переменная для файла логов.
+// Используем Arc<Mutex<TokioFile>> для безопасного доступа к файлу из разных асинхронных задач.
+static LOG_FILE: Lazy<Arc<Mutex<TokioFile>>> = Lazy::new(|| {
+    // Создаем или открываем файл server.log. Unwrap используется, так как ошибка здесь критична.
+    Arc::new(Mutex::new(TokioFile::from_std(std::fs::File::create("server.log")
+        .expect("Не удалось создать или открыть файл логов"))))
+});
+
+/// Асинхронная функция для логирования сообщений.
+/// Записывает сообщение в консоль с цветом и в файл логов без цвета.
+///
+/// # Аргументы
+/// * `log_type` - Тип сообщения (например, "Server", "Auth", "info", "ERROR").
+/// * `message` - Само сообщение.
+/// * `color` - Цвет для вывода в консоль.
+async fn log_message(log_type: &str, message: &str, color: Color) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let now = Local::now(); // Получаем текущее локальное время
+    let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string(); // Форматируем время
+    let colored_log_type = format!("[{}]", log_type).color(color); // Добавляем цвет для консоли
+    let log_entry_console = format!("{} {} {}\n", timestamp, colored_log_type, message);
+
+    // Вывод в консоль с цветом
+    println!("{}", log_entry_console.trim_end());
+
+    // Запись в файл логов (без кодов цвета)
+    let mut file_guard = LOG_FILE.lock().await; // Блокируем мьютекс для доступа к файлу
+    file_guard.write_all(format!("{} [{}] {}\n", timestamp, log_type, message).as_bytes()).await?;
+    file_guard.flush().await?; // Убеждаемся, что данные записаны на диск
+    Ok(())
+}
+
 // основная функция сервера, запускаемая Tokio
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -40,6 +73,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .status();
     }
 
+    // Инициализируем файл логов, создавая его (или очищая, если существует)
+    let _ = TokioFile::create("server.log").await?;
+    log_message("Server", "Файл логов инициализирован.", Color::White).await?;
+
+
     // загрузка базы данных пользователей из файла "users.txt"
     let users_db = Arc::new(Mutex::new(load_users("users.txt").await?));
     // hashMap для хранения подключенных пользователей
@@ -47,12 +85,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // запуск TCP-слушателя на всех сетевых интерфейсах по порту 8080
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!("{}", "Сервер запущен на 127.0.0.1:8080".green());
+    log_message("Server", "Сервер запущен на 127.0.0.1:8080", Color::Green).await?;
 
     // бесконечный цикл для принятия входящих соединений
     loop {
         let (socket, addr) = listener.accept().await?; // принимаем новое соединение
-        println!("{} {}", "Новое подключение:".yellow(), addr);
+        log_message("info", &format!("Новое подключение: {}", addr), Color::Yellow).await?;
 
         // клонируем Arc-указатели для передачи владения новой задаче
         let users_db_clone = users_db.clone();
@@ -63,14 +101,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let client_addr = addr; // сохраняем адрес клиента для логирования
             // обрабатываем клиента, логируя результат (успех или ошибка) (возможно логирование некоторых вещей уже избыточно, но мне нужно было для отладки)
             match handle_client(socket, users_db_clone, connected_users_clone).await {
-                Ok(_) => println!("{} {} {}", "Клиент".yellow(), client_addr, "отключился корректно."),
-                Err(e) => eprintln!("{} {}: {:?} {}", "ОШИБКА С КЛИЕНТОМ".red(), client_addr, e, "Клиент отключился с ошибкой."),
+                Ok(_) => {
+                    let _ = log_message("Client", &format!("Клиент {} отключился корректно.", client_addr), Color::Yellow).await;
+                },
+                Err(e) => {
+                    let _ = log_message("ERROR", &format!("Ошибка с клиентом {}: {:?} Клиент отключился с ошибкой.", client_addr, e), Color::Red).await;
+                },
             }
         });
     }
 }
 
-// асинхронная функция для загрузки пользователей из файла
+/// Асинхронная функция для загрузки пользователей из файла.
 async fn load_users(path: &str) -> Result<HashMap<String, String>, Box<dyn Error + Send + Sync>> {
     let mut users = HashMap::new();
     let path_obj = Path::new(path);
@@ -78,7 +120,7 @@ async fn load_users(path: &str) -> Result<HashMap<String, String>, Box<dyn Error
     // если файла нет, создаем его
     if !path_obj.exists() {
         TokioFile::create(path).await?;
-        println!("{} {}", "Создан пустой файл пользователей:".blue(), path);
+        log_message("info", &format!("Создан пустой файл пользователей: {}", path), Color::Blue).await?;
         return Ok(users);
     }
 
@@ -92,14 +134,14 @@ async fn load_users(path: &str) -> Result<HashMap<String, String>, Box<dyn Error
         if parts.len() == 2 {
             users.insert(parts[0].to_string(), parts[1].to_string());
         } else if !line.trim().is_empty() {
-            eprintln!("{} Неверный формат строки в users.txt: {}", "ВНИМАНИЕ:".red(), line);
+            log_message("WARNING", &format!("Неверный формат строки в users.txt: {}", line), Color::Red).await?;
         }
     }
-    println!("{} {} пользователей загружено из {}", "Загружено".green(), users.len(), path);
+    log_message("info", &format!("Загружено {} пользователей из {}", users.len(), path), Color::Green).await?;
     Ok(users)
 }
 
-// асинхронная функция для добавления нового пользователя в файл
+/// Асинхронная функция для добавления нового пользователя в файл.
 async fn add_user_to_file(path: &str, username: &str, password: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut file = TokioOpenOptions::new()
         .append(true) // Открываем файл в режиме добавления
@@ -108,10 +150,11 @@ async fn add_user_to_file(path: &str, username: &str, password: &str) -> Result<
         .await?;
     file.write_all(format!("{}:{}\n", username, password).as_bytes()).await?;
     file.flush().await?; // Сбрасываем буфер, чтобы данные были записаны на диск
+    log_message("Auth", &format!("Пользователь '{}' зарегистрирован и добавлен в файл.", username), Color::Green).await?;
     Ok(())
 }
 
-// асинхронная функция для широковещательной рассылки сообщений
+/// Асинхронная функция для широковещательной рассылки сообщений.
 async fn broadcast_message(
     connected_users: &Arc<Mutex<HashMap<String, Tx>>>,
     sender: &str,
@@ -132,9 +175,12 @@ async fn broadcast_message(
             let _ = tx.send(full_msg); // игнорируем ошибку, если получатель уже отключился
         }
     }
+    if !is_system_message {
+        log_message("Global message", &format!("'{}' отправил в общий чат: {}", sender, message), Color::Blue).await.unwrap_or_else(|e| eprintln!("Ошибка логирования широковещательного сообщения: {:?}", e));
+    }
 }
 
-// асинхронная функция для отправки сообщения конкретному пользователю
+/// Асинхронная функция для отправки сообщения конкретному пользователю.
 async fn send_to_user(
     connected_users: &Arc<Mutex<HashMap<String, Tx>>>,
     recipient_nick: &str,
@@ -145,21 +191,23 @@ async fn send_to_user(
         // клонируем сообщение перед отправкой, чтобы можно было использовать его для логирования
         if tx.send(message.clone()).is_err() {
             // если канал закрыт (получатель отключился)
-            eprintln!("{} ОШИБКА: Канал к пользователю '{}' закрыт. Возможно, клиент отключился.", "СЕРВЕР:".red(), recipient_nick);
-            Err(format!("Не удалось отправить сообщение пользователю {}", recipient_nick))
+            let error_msg = format!("Не удалось отправить сообщение пользователю {}", recipient_nick);
+            log_message("ERROR", &format!("Канал к пользователю '{}' закрыт. Возможно, клиент отключился. Ошибка: {}", recipient_nick, error_msg), Color::Red).await.unwrap_or_else(|e| eprintln!("Ошибка логирования send_to_user: {:?}", e));
+            Err(error_msg)
         } else {
             // сообщение успешно отправлено в канал
-            println!("{} ОТПРАВЛЕНО: Сообщение для '{}' (начало: {})", "СЕРВЕР:".green(), recipient_nick, &message[..std::cmp::min(message.len(), 50)]);
+            log_message("Sent", &format!("Сообщение отправлено '{}' (начало: {})", recipient_nick, &message[..std::cmp::min(message.len(), 50)]), Color::Green).await.unwrap_or_else(|e| eprintln!("Ошибка логирования send_to_user: {:?}", e));
             Ok(())
         }
     } else {
         // пользователь не найден в списке подключенных
-        eprintln!("{} ОШИБКА: Пользователь '{}' не найден в connected_users.", "СЕРВЕР:".red(), recipient_nick);
-        Err(format!("Пользователь {} не найден или не в сети.", recipient_nick))
+        let error_msg = format!("Пользователь {} не найден или не в сети.", recipient_nick);
+        log_message("ERROR", &format!("Пользователь '{}' не найден в connected_users. Ошибка: {}", recipient_nick, error_msg), Color::Red).await.unwrap_or_else(|e| eprintln!("Ошибка логирования send_to_user: {:?}", e));
+        Err(error_msg)
     }
 }
 
-// ОСНОВНАЯ ФУНКЦИЯ ОБРАБОТКИ
+// ОСНОВНАЯ ФУНКЦИЯ ОБРАБОТКИ КЛИЕНТА
 async fn handle_client(
     socket: TcpStream,
     users_db: Arc<Mutex<HashMap<String, String>>>,
@@ -186,6 +234,7 @@ async fn handle_client(
             let mut writer_guard = writer_arc.lock().await;
             writer_guard.write_all("Превышено количество попыток. Отключение.\n".as_bytes()).await?;
             writer_guard.flush().await?;
+            log_message("Auth", "Неудачная авторизация: Превышено количество попыток.", Color::Red).await?;
             return Err("Неудачная авторизация".into()); // выход с ошибкой
         }
 
@@ -196,7 +245,10 @@ async fn handle_client(
             writer_guard.flush().await?;
         }
         let mut nick_input = String::new();
-        if reader.read_line(&mut nick_input).await? == 0 { return Err("Клиент отключился до авторизации".into()); }
+        if reader.read_line(&mut nick_input).await? == 0 {
+            log_message("Client", "Клиент отключился до авторизации (ввод никнейма).", Color::Yellow).await?;
+            return Err("Клиент отключился до авторизации".into());
+        }
         let nick_input = nick_input.trim().to_string();
 
         // Запрос пароля
@@ -206,7 +258,10 @@ async fn handle_client(
             writer_guard.flush().await?;
         }
         let mut pass_input = String::new();
-        if reader.read_line(&mut pass_input).await? == 0 { return Err("Клиент отключился до авторизации".into()); }
+        if reader.read_line(&mut pass_input).await? == 0 {
+            log_message("Client", "Клиент отключился до авторизации (ввод пароля).", Color::Yellow).await?;
+            return Err("Клиент отключился до авторизации".into());
+        }
         let pass_input = pass_input.trim().to_string();
 
         let mut db_guard = users_db.lock().await; // Блокируем БД пользователей
@@ -217,7 +272,7 @@ async fn handle_client(
                 let mut writer_guard = writer_arc.lock().await;
                 writer_guard.write_all("Авторизация успешна!\n".as_bytes()).await?;
                 writer_guard.flush().await?;
-                println!("{}", format!("Пользователь '{}' авторизовался", nickname).green());
+                log_message("Auth", &format!("Пользователь '{}' авторизовался успешно.", nickname), Color::Green).await?;
                 break;
             }
             None => {
@@ -226,7 +281,10 @@ async fn handle_client(
                 writer_guard.write_all("Пользователь не найден. Хотите зарегистрироваться? (да/нет):\n".as_bytes()).await?;
                 writer_guard.flush().await?;
                 let mut answer = String::new();
-                if reader.read_line(&mut answer).await? == 0 { return Err("Клиент отключился во время регистрации".into()); }
+                if reader.read_line(&mut answer).await? == 0 {
+                    log_message("Client", "Клиент отключился во время запроса регистрации.", Color::Yellow).await?;
+                    return Err("Клиент отключился во время регистрации".into());
+                }
                 let answer = answer.trim().to_lowercase();
                 if answer == "да" || answer == "yes" {
                     db_guard.insert(nick_input.clone(), pass_input.clone());
@@ -238,12 +296,13 @@ async fn handle_client(
                     let mut writer_guard = writer_arc.lock().await;
                     writer_guard.write_all("Регистрация успешна! Вы авторизованы.\n".as_bytes()).await?;
                     writer_guard.flush().await?;
-                    println!("{}", format!("Пользователь '{}' зарегистрировался", nickname).green());
+                    log_message("Auth", &format!("Пользователь '{}' зарегистрировался.", nickname), Color::Green).await?;
                     break; // Выходим из цикла авторизации
                 } else {
                     writer_guard.write_all("Попробуйте снова.\n".as_bytes()).await?;
                     writer_guard.flush().await?;
                     attempts -= 1; // Уменьшаем количество попыток
+                    log_message("Auth", &format!("Пользователь '{}' отклонил регистрацию. Осталось попыток: {}", nick_input, attempts), Color::Yellow).await?;
                 }
             }
             Some(_) => {
@@ -252,9 +311,10 @@ async fn handle_client(
                 writer_guard.write_all("Неверный пароль. Попробуйте снова.\n".as_bytes()).await?;
                 writer_guard.flush().await?;
                 attempts -= 1; // Уменьшаем количество попыток
+                log_message("Auth", &format!("Пользователь '{}' ввел неверный пароль. Осталось попыток: {}", nick_input, attempts), Color::Yellow).await?;
             }
         }
-    } 
+    }
 
     // Проверка, если никнейм уже в сети
     {
@@ -263,6 +323,7 @@ async fn handle_client(
             let mut writer_guard = writer_arc.lock().await;
             writer_guard.write_all("Пользователь с таким ником уже в сети. Отключение.\n".as_bytes()).await?;
             writer_guard.flush().await?;
+            log_message("Auth", &format!("Обнаружен дубликат никнейма '{}'. Отключение клиента.", nickname), Color::Red).await?;
             return Err("Дубликат никнейма".into()); // Выходим с ошибкой
         }
     }
@@ -293,7 +354,7 @@ async fn handle_client(
 
     // сообщение о входе нового пользователя
     let join_msg = format!("Пользователь '{}' вошёл в чат", nickname);
-    println!("{}", join_msg.yellow());
+    log_message("Auth", &join_msg, Color::Yellow).await?;
     broadcast_message(&connected_users, &nickname, &join_msg, true).await;
     let client_state = Arc::new(Mutex::new(ClientState::PublicChat));
 
@@ -310,12 +371,12 @@ async fn handle_client(
                 let mut line = String::new();
                 let _bytes_read = match reader.read_line(&mut line).await {
                     Ok(0) => { // Клиент отключился
-                        println!("{} {}: Клиент отключился (return 0).", "ИНФО:".cyan(), nickname_read);
+                        log_message("Client", &format!("{}: Клиент отключился (прочитано 0 байт).", nickname_read), Color::Cyan).await?;
                         break Ok(()); // Завершаем задачу успешно
                     },
                     Ok(n) => n, // Успешно прочитано(кол-во байт)
                     Err(e) => { // Ошибка чтения
-                        eprintln!("{} Ошибка чтения от {}: {}", "ОШИБКА:".red(), nickname_read, e);
+                        log_message("Error", &format!("Ошибка чтения от {}: {}", nickname_read, e), Color::Red).await?;
                         break Err(e.into()); // Завершаем задачу с ошибкой
                     },
                 };
@@ -323,26 +384,29 @@ async fn handle_client(
                 let msg_trimmed = line.trim();
                 if msg_trimmed.is_empty() { continue; } // Пропускаем пустые строки
 
-                let mut current_writer_guard = writer_arc_clone.lock().await;
-                let mut state_guard = client_state_read.lock().await;
-
                 // Проверка на команду "выход" из приватного чата
                 if msg_trimmed.to_lowercase() == "выход" {
+                    let mut state_guard = client_state_read.lock().await; // Захватываем мьютекс
                     if let ClientState::InPrivateChat { with_nick, shared_key: _ } = &*state_guard {
                         let partner_nick = with_nick.clone();
-                        // Уведомляем партнера о выходе из приватного чата
+                        *state_guard = ClientState::PublicChat; // Изменяем состояние
+                        drop(state_guard); // Освобождаем мьютекс перед await
+
                         let _ = send_to_user(
                             &connected_users_read,
                             &partner_nick,
                             format!("SYSTEM:PRIVATE_CHAT_ENDED:{}", nickname_read)
                         ).await;
-                        // Уведомляем текущего клиента
-                        current_writer_guard.write_all("Вы вышли из личного чата. Возвращение в общий чат.\n".as_bytes()).await?;
-                        current_writer_guard.flush().await?;
-                        *state_guard = ClientState::PublicChat; // Возвращаем клиента в общий чат
-                        println!("{} '{}' вышел из приватного чата с '{}'", "ИНФО:".cyan(), nickname_read, partner_nick);
+
+                        let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                        writer_guard.write_all("Вы вышли из личного чата. Возвращение в общий чат.\n".as_bytes()).await?;
+                        writer_guard.flush().await?;
+                        drop(writer_guard); // Освобождаем мьютекс перед await
+
+                        log_message("info", &format!("'{}' вышел из приватного чата с '{}'", nickname_read, partner_nick), Color::Cyan).await?;
                         continue;
                     }
+                    drop(state_guard); // Освобождаем мьютекс, если не в приватном чате
                 }
 
                 // Обработка команд (/help, /list, /pm, /accept, /reject)
@@ -353,7 +417,8 @@ async fn handle_client(
 
                     match command.as_str() {
                         "help" => {
-                            current_writer_guard.write_all(
+                            let mut writer_guard = writer_arc_clone.lock().await;
+                            writer_guard.write_all(
                                 "Доступные команды:\n\
                                  \t/help - Показать это сообщение\n\
                                  \t/list - Показать список подключённых пользователей\n\
@@ -364,6 +429,9 @@ async fn handle_client(
                                  \tлюбое_сообщение - Отправить сообщение всем в публичный чат\n"
                                 .as_bytes()
                             ).await?;
+                            writer_guard.flush().await?;
+                            drop(writer_guard);
+                            log_message("Cmd", &format!("'{}' запросил /help", nickname_read), Color::Magenta).await?;
                         }
                         "list" => {
                             let users = connected_users_read.lock().await;
@@ -371,19 +439,34 @@ async fn handle_client(
                                 .filter(|name| *name != &nickname_read)
                                 .cloned()
                                 .collect();
+                            drop(users); // Освобождаем мьютекс после использования
+
+                            let mut writer_guard = writer_arc_clone.lock().await;
                             if connected_list.is_empty() {
-                                current_writer_guard.write_all("Пока никто больше не подключён.\n".as_bytes()).await?;
+                                writer_guard.write_all("Пока никто больше не подключён.\n".as_bytes()).await?;
                             } else {
-                                current_writer_guard.write_all(format!("Сейчас в сети: {}\n", connected_list.join(", ")).as_bytes()).await?;
+                                writer_guard.write_all(format!("Сейчас в сети: {}\n", connected_list.join(", ")).as_bytes()).await?;
                             }
+                            writer_guard.flush().await?;
+                            drop(writer_guard);
+                            log_message("Cmd", &format!("'{}' запросил /list. Онлайн пользователи: {}", nickname_read, connected_list.join(", ")), Color::Magenta).await?;
                         }
                         "pm" => {
                             if args.is_empty() {
-                                current_writer_guard.write_all("Укажите ник пользователя для личного чата: /pm <ник>\n".as_bytes()).await?;
+                                let mut writer_guard = writer_arc_clone.lock().await;
+                                writer_guard.write_all("Укажите ник пользователя для личного чата: /pm <ник>\n".as_bytes()).await?;
+                                writer_guard.flush().await?;
+                                drop(writer_guard);
+                                log_message("Cmd", &format!("'{}' ввел /pm без цели.", nickname_read), Color::Red).await?;
                             } else if args == nickname_read {
-                                current_writer_guard.write_all("Вы не можете начать личный чат с самим собой.\n".as_bytes()).await?;
+                                let mut writer_guard = writer_arc_clone.lock().await;
+                                writer_guard.write_all("Вы не можете начать личный чат с самим собой.\n".as_bytes()).await?;
+                                writer_guard.flush().await?;
+                                drop(writer_guard);
+                                log_message("Cmd", &format!("'{}' пытался начать /pm с самим собой.", nickname_read), Color::Red).await?;
                             }
                             else {
+                                let mut state_guard = client_state_read.lock().await; // Захватываем мьютекс
                                 match &mut *state_guard { // Используем &mut * для изменения состояния
                                     ClientState::PublicChat => {
                                         let target_nick = args.to_string();
@@ -393,68 +476,129 @@ async fn handle_client(
                                         let shared_key = key_bytes.to_vec();
                                         let key_hex = hex::encode(&shared_key);
 
-                                        if send_to_user(&connected_users_read, &target_nick, format!("SYSTEM:PRIVATE_CHAT_REQUEST:{}:{}", nickname_read, key_hex)).await.is_ok() {
-                                            current_writer_guard.write_all(format!("Запрос на личный чат отправлен пользователю '{}'. Ожидание ответа...\n", target_nick).as_bytes()).await?;
-                                            // Сохраняем отправленный ключ в состоянии
-                                            *state_guard = ClientState::WaitingForPrivateChatResponse { target_nick: target_nick.clone(), sent_key: shared_key };
-                                            println!("{} '{}' запросил приватный чат у '{}'", "ИНФО:".cyan(), nickname_read, target_nick);
+                                        // Store needed info and drop state_guard before await
+                                        let current_nickname = nickname_read.clone();
+                                        let target_nick_clone = target_nick.clone();
+                                        let shared_key_clone = shared_key.clone(); // Clone shared_key for the state change
+                                        *state_guard = ClientState::WaitingForPrivateChatResponse { target_nick: target_nick.clone(), sent_key: shared_key_clone };
+                                        drop(state_guard); // Освобождаем мьютекс
+
+                                        if send_to_user(&connected_users_read, &target_nick_clone, format!("SYSTEM:PRIVATE_CHAT_REQUEST:{}:{}", current_nickname, key_hex)).await.is_ok() {
+                                            let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                            writer_guard.write_all(format!("Запрос на личный чат отправлен пользователю '{}'. Ожидание ответа...\n", target_nick_clone).as_bytes()).await?;
+                                            writer_guard.flush().await?;
+                                            drop(writer_guard); // Освобождаем мьютекс
+                                            log_message("Private chat", &format!("'{}' запросил приватный чат у '{}'", current_nickname, target_nick_clone), Color::Cyan).await?;
                                         } else {
-                                            current_writer_guard.write_all(format!("Пользователь '{}' не найден или не в сети.\n", target_nick).as_bytes()).await?;
+                                            let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                            writer_guard.write_all(format!("Пользователь '{}' не найден или не в сети.\n", target_nick_clone).as_bytes()).await?;
+                                            writer_guard.flush().await?;
+                                            drop(writer_guard); // Освобождаем мьютекс
+                                            log_message("Private chat", &format!("'{}' пытался запросить приватный чат у оффлайн пользователя '{}'", current_nickname, target_nick_clone), Color::Red).await?;
                                         }
                                     }
                                     _ => {
-                                        current_writer_guard.write_all("Вы не можете начать новый личный чат, находясь не в общем чате.\n".as_bytes()).await?;
+                                        let state_for_log = format!("{:?}", *state_guard); // Клонируем для логирования
+                                        drop(state_guard); // Освобождаем мьютекс
+                                        let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                        writer_guard.write_all("Вы не можете начать новый личный чат, находясь не в общем чате.\n".as_bytes()).await?;
+                                        writer_guard.flush().await?;
+                                        drop(writer_guard); // Освобождаем мьютекс
+                                        log_message("Private chat", &format!("'{}' пытался инициировать ЛС, находясь не в общем чате (текущее состояние: {})", nickname_read, state_for_log), Color::Red).await?;
                                     }
                                 }
                             }
                         }
                         "accept" => {
+                            let mut state_guard = client_state_read.lock().await; // Захватываем мьютекс
                             if let ClientState::HasPendingPrivateChatRequest { from_nick, shared_key } = &mut *state_guard {
                                 let partner_nick = from_nick.clone();
                                 let key_to_use = shared_key.clone(); // Ключ получен с запросом
-                                if send_to_user(&connected_users_read, &partner_nick, format!("SYSTEM:PRIVATE_CHAT_ACCEPTED:{}", nickname_read)).await.is_ok() {
-                                    current_writer_guard.write_all(format!("Вы начали личный чат с '{}'. Напишите 'выход' для возврата в общий чат.\n", partner_nick).as_bytes()).await?;
-                                    *state_guard = ClientState::InPrivateChat { with_nick: partner_nick.clone(), shared_key: key_to_use };
-                                    println!("{} '{}' принял приватный чат от '{}'", "ИНФО:".cyan(), nickname_read, partner_nick);
+                                let current_nickname = nickname_read.clone();
+                                *state_guard = ClientState::InPrivateChat { with_nick: partner_nick.clone(), shared_key: key_to_use };
+                                drop(state_guard); // Освобождаем мьютекс
+
+                                if send_to_user(&connected_users_read, &partner_nick, format!("SYSTEM:PRIVATE_CHAT_ACCEPTED:{}", current_nickname)).await.is_ok() {
+                                    let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                    writer_guard.write_all(format!("Вы начали личный чат с '{}'. Напишите 'выход' для возврата в общий чат.\n", partner_nick).as_bytes()).await?;
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' обновил статус: приватный чат с '{}'", current_nickname, partner_nick), Color::Cyan).await?;
                                 } else {
-                                    current_writer_guard.write_all(format!("Не удалось уведомить '{}', возможно, он отключился. Вы возвращены в общий чат.\n", partner_nick).as_bytes()).await?;
-                                    *state_guard = ClientState::PublicChat; // Возврат в общий чат
+                                    let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                    writer_guard.write_all(format!("Не удалось уведомить '{}', возможно, он отключился. Вы возвращены в общий чат.\n", partner_nick).as_bytes()).await?;
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' принял приватный чат от '{}', но не смог уведомить партнера.", current_nickname, partner_nick), Color::Red).await?;
+                                    // Re-acquire state_guard to revert state if partner disconnected
+                                    let mut state_guard_revert = client_state_read.lock().await;
+                                    *state_guard_revert = ClientState::PublicChat;
+                                    drop(state_guard_revert); // Освобождаем мьютекс
                                 }
                             } else {
-                                current_writer_guard.write_all("Нет активных запросов на личный чат для принятия.\n".as_bytes()).await?;
+                                drop(state_guard); // Освобождаем мьютекс, если нет запроса
+                                let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                writer_guard.write_all("Нет активных запросов на личный чат для принятия.\n".as_bytes()).await?;
+                                writer_guard.flush().await?;
+                                drop(writer_guard); // Освобождаем мьютекс
+                                log_message("Cmd", &format!("'{}' пытался /accept без ожидающего запроса.", nickname_read), Color::Yellow).await?;
                             }
                         }
                         "reject" => {
+                            let mut state_guard = client_state_read.lock().await; // Захватываем мьютекс
                             if let ClientState::HasPendingPrivateChatRequest { from_nick, shared_key: _ } = &mut *state_guard {
                                 let partner_nick = from_nick.clone();
-                                if send_to_user(&connected_users_read, &partner_nick, format!("SYSTEM:PRIVATE_CHAT_REJECTED:{}", nickname_read)).await.is_ok() {
-                                    current_writer_guard.write_all(format!("Вы отклонили запрос на личный чат от '{}'.\n", partner_nick).as_bytes()).await?;
-                                    println!("{} '{}' отклонил приватный чат от '{}'", "ИНФО:".cyan(), nickname_read, partner_nick);
+                                let current_nickname = nickname_read.clone();
+                                *state_guard = ClientState::PublicChat; // Изменяем состояние
+                                drop(state_guard); // Освобождаем мьютекс
+
+                                if send_to_user(&connected_users_read, &partner_nick, format!("SYSTEM:PRIVATE_CHAT_REJECTED:{}", current_nickname)).await.is_ok() {
+                                    let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                    writer_guard.write_all(format!("Вы отклонили запрос на личный чат от '{}'.\n", partner_nick).as_bytes()).await?;
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' отклонил приватный чат от '{}'", current_nickname, partner_nick), Color::Cyan).await?;
                                 } else {
-                                    current_writer_guard.write_all(format!("Не удалось уведомить '{}' об отклонении, возможно, он отключился.\n", partner_nick).as_bytes()).await?;
+                                    let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                    writer_guard.write_all(format!("Не удалось уведомить '{}' об отклонении, возможно, он отключился.\n", partner_nick).as_bytes()).await?;
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' отклонил приватный чат от '{}', но не смог уведомить партнера.", current_nickname, partner_nick), Color::Red).await?;
                                 }
-                                *state_guard = ClientState::PublicChat;
                             } else {
-                                current_writer_guard.write_all("Нет активных запросов на личный чат для отклонения.\n".as_bytes()).await?;
+                                drop(state_guard); // Освобождаем мьютекс, если нет запроса
+                                let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                writer_guard.write_all("Нет активных запросов на личный чат для отклонения.\n".as_bytes()).await?;
+                                writer_guard.flush().await?;
+                                drop(writer_guard); // Освобождаем мьютекс
+                                log_message("Cmd", &format!("'{}' пытался /reject без ожидающего запроса.", nickname_read), Color::Yellow).await?;
                             }
                         }
                         _ => {
-                            current_writer_guard.write_all(format!("Неизвестная команда: '{}'. Введите /help.\n", command).as_bytes()).await?;
+                            let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                            writer_guard.write_all(format!("Неизвестная команда: '{}'. Введите /help.\n", command).as_bytes()).await?;
+                            writer_guard.flush().await?;
+                            drop(writer_guard); // Освобождаем мьютекс
+                            log_message("Cmd", &format!("'{}' ввел неизвестную команду: '{}'", nickname_read, command), Color::Red).await?;
                         }
                     }
-                    current_writer_guard.flush().await?;
                 }
                 // Обработка обычных сообщений или старых личных сообщений
                 else {
-                    match &*state_guard {
+                    let current_state_clone;
+                    {
+                        let state_guard = client_state_read.lock().await; // Захватываем мьютекс
+                        current_state_clone = state_guard.clone(); // Клонируем состояние для использования после освобождения мьютекса
+                    } // state_guard автоматически освобождается здесь
+
+                    match current_state_clone {
                         ClientState::InPrivateChat { with_nick, shared_key } => {
-                            let cipher = Aes256Gcm::new_from_slice(shared_key).expect("Key length is 32 bytes");
+                            let cipher = Aes256Gcm::new_from_slice(&shared_key).expect("Key length is 32 bytes");
                             let mut nonce_array = [0u8; 12]; // GCM nonces are 12 bytes
                             OsRng.fill_bytes(&mut nonce_array);
-                            let nonce = Nonce::from_slice(&nonce_array); // Создаем Nonce из среза массива
+                            let nonce = Nonce::from_slice(&nonce_array);
 
                             let ciphertext_result = cipher.encrypt(&nonce, msg_trimmed.as_bytes());
-
                             match ciphertext_result {
                                 Ok(ciphertext) => {
                                     let encrypted_msg = format!(
@@ -463,52 +607,69 @@ async fn handle_client(
                                         hex::encode(nonce_array), // Кодируем массив nonce в hex
                                         hex::encode(ciphertext) // Кодируем зашифрованный текст в hex
                                     );
-                                    // ИСПРАВЛЕНИЕ: Удаляем эту строку, чтобы не было дублирования сообщения у отправителя
-                                    // let private_msg_echo = format!("[ЛС для {}]: {}\n", with_nick.magenta(), msg_trimmed);
-                                    if send_to_user(&connected_users_read, with_nick, encrypted_msg).await.is_ok() {
-                                        // current_writer_guard.write_all(private_msg_echo.as_bytes()).await?; // Эту строку мы удалили
+                                    if send_to_user(&connected_users_read, &with_nick, encrypted_msg).await.is_ok() {
+                                        log_message("Private", &format!("'{}' отправил зашифрованное ЛС '{}'", nickname_read, with_nick), Color::Blue).await?;
                                     } else {
-                                        current_writer_guard.write_all(format!("Не удалось отправить сообщение '{}'. Возможно, пользователь отключился. Вы возвращены в общий чат.\n", with_nick).as_bytes()).await?;
-                                        *state_guard = ClientState::PublicChat; // Возврат в общий чат
+                                        let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                        writer_guard.write_all(format!("Не удалось отправить сообщение '{}'. Возможно, пользователь отключился. Вы возвращены в общий чат.\n", with_nick).as_bytes()).await?;
+                                        writer_guard.flush().await?;
+                                        drop(writer_guard); // Освобождаем мьютекс
+                                        log_message("Private", &format!("'{}' не смог отправить зашифрованное ЛС '{}'. Партнер отключился.", nickname_read, with_nick), Color::Red).await?;
+                                        // Re-acquire state_guard to change state
+                                        let mut state_guard_revert = client_state_read.lock().await; // Захватываем мьютекс
+                                        *state_guard_revert = ClientState::PublicChat;
+                                        drop(state_guard_revert); // Освобождаем мьютекс
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("{} Ошибка шифрования для {}: {:?}", "ОШИБКА:".red(), nickname_read, e);
-                                    current_writer_guard.write_all("Ошибка шифрования сообщения. Попробуйте снова.\n".as_bytes()).await?;
+                                    log_message("Error", &format!("Ошибка шифрования для {}: {:?}", nickname_read, e), Color::Red).await?;
+                                    let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                    writer_guard.write_all("Ошибка шифрования сообщения. Попробуйте снова.\n".as_bytes()).await?;
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
                                 }
                             }
-                            current_writer_guard.flush().await?;
                         }
                         ClientState::PublicChat => {
-                            // Старый формат ЛС (не рекомендуется) или публичное сообщение
                             if let Some(idx) = msg_trimmed.find(':') {
-                                let recipient = msg_trimmed[..idx].trim();
-                                let message_content = msg_trimmed[idx + 1..].trim();
+                                let recipient = msg_trimmed[..idx].trim().to_string(); // Клонируем
+                                let message_content = msg_trimmed[idx + 1..].trim().to_string(); // Клонируем
+
                                 if recipient == nickname_read {
-                                     current_writer_guard.write_all("Вы не можете отправить ЛС самому себе.\n".as_bytes()).await?;
+                                     let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                     writer_guard.write_all("Вы не можете отправить ЛС самому себе.\n".as_bytes()).await?;
+                                     writer_guard.flush().await?;
+                                     drop(writer_guard); // Освобождаем мьютекс
+                                     log_message("MSG", &format!("'{}' пытался отправить ЛС самому себе.", nickname_read), Color::Red).await?;
                                 } else {
-                                    // Здесь старые ЛС не шифруются, т.к. нет общего ключа
                                     let full_msg = format!("{} {}: {}\n", "Вам".cyan(), nickname_read, message_content);
-                                    if send_to_user(&connected_users_read, recipient, full_msg).await.is_ok() {
-                                        // ИСПРАВЛЕНИЕ: Удаляем эту строку, чтобы не было дублирования сообщения у отправителя
-                                        // current_writer_guard.write_all(format!("[ЛС для {}]: {}\n", recipient, message_content).as_bytes()).await?;
+                                    if send_to_user(&connected_users_read, &recipient, full_msg).await.is_ok() {
+                                        log_message("MSG", &format!("'{}' отправил прямое сообщение '{}'", nickname_read, recipient), Color::Green).await?;
                                     } else {
-                                        current_writer_guard.write_all(format!("{} Пользователь '{}' не найден или не в сети.\n", "Ошибка:".red(), recipient).as_bytes()).await?;
+                                        let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                                        writer_guard.write_all(format!("{} Пользователь '{}' не найден или не в сети.\n", "Ошибка:".red(), recipient).as_bytes()).await?;
+                                        writer_guard.flush().await?;
+                                        drop(writer_guard); // Освобождаем мьютекс
+                                        log_message("MSG", &format!("'{}' не смог отправить прямое сообщение оффлайн пользователю '{}'", nickname_read, recipient), Color::Red).await?;
                                     }
                                 }
-                                current_writer_guard.flush().await?;
                             } else {
-                                // Публичное сообщение
                                 broadcast_message(&connected_users_read, &nickname_read, msg_trimmed, false).await;
                             }
                         }
                         ClientState::WaitingForPrivateChatResponse { target_nick, sent_key: _ } => {
-                            current_writer_guard.write_all(format!("Вы ожидаете ответа от '{}'. Чтобы отправить сообщение в общий чат, сначала отмените запрос (пока не реализовано) или дождитесь ответа.\n", target_nick).as_bytes()).await?;
-                            current_writer_guard.flush().await?;
+                            let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                            writer_guard.write_all(format!("Вы ожидаете ответа от '{}'. Чтобы отправить сообщение в общий чат, сначала отмените запрос (пока не реализовано) или дождитесь ответа.\n", target_nick).as_bytes()).await?;
+                            writer_guard.flush().await?;
+                            drop(writer_guard); // Освобождаем мьютекс
+                            log_message("Client state", &format!("'{}' пытался отправить сообщение в состоянии WaitingForPrivateChatResponse.", nickname_read), Color::Yellow).await?;
                         }
                         ClientState::HasPendingPrivateChatRequest { from_nick, shared_key: _ } => {
-                            current_writer_guard.write_all(format!("У вас есть запрос на личный чат от '{}'. Введите /accept или /reject.\n", from_nick).as_bytes()).await?;
-                            current_writer_guard.flush().await?;
+                            let mut writer_guard = writer_arc_clone.lock().await; // Захватываем мьютекс
+                            writer_guard.write_all(format!("У вас есть запрос на личный чат от '{}'. Введите /accept или /reject.\n", from_nick).as_bytes()).await?;
+                            writer_guard.flush().await?;
+                            drop(writer_guard); // Освобождаем мьютекс
+                            log_message("Client state", &format!("'{}' пытался отправить сообщение в состоянии HasPendingPrivateChatRequest.", nickname_read), Color::Yellow).await?;
                         }
                     }
                 }
@@ -530,23 +691,20 @@ async fn handle_client(
             let res: Result<(), Box<dyn Error + Send + Sync>> = loop {
                 let msg_str = match rx_from_others.recv().await {
                     Some(msg) => {
-                        println!("{} RECEIVED_BY_WRITE_TASK ({}): {}", "ИНФО:".yellow(), nickname_write, msg.trim()); // Логируем полученное сообщение
+                        log_message("Recieve", &format!("Получено write_task ({}): {}", nickname_write, msg.trim()), Color::Yellow).await?;
                         msg
                     },
                     None => { // Канал закрыт, задача записи завершается
-                        println!("{} {}: Канал rx_from_others закрыт (write_task завершается).", "ИНФО:".cyan(), nickname_write);
+                        log_message("Client", &format!("{}: Канал rx_from_others закрыт (write_task завершается).", nickname_write), Color::Cyan).await?;
                         break Ok(()); // Завершаем задачу успешно
                     },
                 };
-                
-                let mut writer_guard = writer_arc_for_task.lock().await;
-                let mut state_guard = client_state_write.lock().await;
 
                 if msg_str.starts_with("SYSTEM:") {
                     // Разделяем системное сообщение на команду и аргументы
                     let parts: Vec<&str> = msg_str.splitn(2, ':').collect();
                     if parts.len() < 2 {
-                        eprintln!("{} Некорректное системное сообщение: {}", "ОШИБКА СЕРВЕРА:".red(), msg_str);
+                        log_message("Error", &format!("Некорректное системное сообщение: {}", msg_str), Color::Red).await?;
                         continue; // Продолжаем цикл, чтобы не прерывать задачу из-за одного плохого сообщения
                     }
 
@@ -563,80 +721,121 @@ async fn handle_client(
                                 let key_hex = request_args[1];
                                 match hex::decode(key_hex) {
                                     Ok(shared_key) => {
+                                        let mut state_guard = client_state_write.lock().await; // Захватываем мьютекс
                                         match &mut *state_guard {
                                             ClientState::PublicChat => {
                                                 *state_guard = ClientState::HasPendingPrivateChatRequest { from_nick: sender_nick.clone(), shared_key };
-                                                if writer_guard.write_all(format!("Пользователь '{}' хочет начать с вами личный чат. Введите /accept или /reject.\n", sender_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
-                                                println!("{} '{}' получил запрос на приватный чат от '{}'", "ИНФО:".cyan(), nickname_write, sender_nick);
+                                                drop(state_guard); // Освобождаем мьютекс
+                                                let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                                if writer_guard.write_all(format!("Пользователь '{}' хочет начать с вами личный чат. Введите /accept или /reject.\n", sender_nick).as_bytes()).await.is_err() { break Ok(()); }
+                                                writer_guard.flush().await?;
+                                                drop(writer_guard); // Освобождаем мьютекс
+                                                log_message("Private chat", &format!("'{}' получил запрос на приватный чат от '{}'", nickname_write, sender_nick), Color::Cyan).await?;
                                             }
                                             _ => { // Клиент уже в другом состоянии
-                                                drop(writer_guard); // Освобождаем guard перед send_to_user
+                                                drop(state_guard); // Освобождаем мьютекс
                                                 let _ = send_to_user(&connected_users_write, &sender_nick, format!("SYSTEM:PRIVATE_CHAT_BUSY:{}", nickname_write)).await;
-                                                continue;
+                                                log_message("Private chat", &format!("'{}' получил запрос на приватный чат от '{}', но был занят.", nickname_write, sender_nick), Color::Yellow).await?;
                                             }
                                         }
                                     }
                                     Err(_) => {
-                                        eprintln!("{} Неверный формат ключа в PRIVATE_CHAT_REQUEST от {}", "ОШИБКА СЕРВЕРА:".red(), sender_nick);
-                                        if writer_guard.write_all("Получен некорректный запрос на приватный чат (ошибка ключа).\n".as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                        let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                        if writer_guard.write_all("Получен некорректный запрос на приватный чат (ошибка ключа).\n".as_bytes()).await.is_err() { break Ok(()); }
+                                        writer_guard.flush().await?;
+                                        drop(writer_guard); // Освобождаем мьютекс
+                                        log_message("Error", &format!("Неверный формат ключа в PRIVATE_CHAT_REQUEST от {}", sender_nick), Color::Red).await?;
                                     }
                                 }
                             } else {
-                                eprintln!("{} Некорректный формат PRIVATE_CHAT_REQUEST: {}", "ОШИБКА СЕРВЕРА:".red(), msg_str);
-                                if writer_guard.write_all("Получен некорректный запрос на приватный чат.\n".as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                if writer_guard.write_all("Получен некорректный запрос на приватный чат.\n".as_bytes()).await.is_err() { break Ok(()); }
+                                writer_guard.flush().await?;
+                                drop(writer_guard); // Освобождаем мьютекс
+                                log_message("Error", &format!("Некорректный формат PRIVATE_CHAT_REQUEST: {}", msg_str), Color::Red).await?;
                             }
                         }
                         "PRIVATE_CHAT_ACCEPTED" => {
                             let originator_nick = args.to_string();
+                            let mut state_guard = client_state_write.lock().await; // Захватываем мьютекс
                             match &mut *state_guard {
                                 ClientState::WaitingForPrivateChatResponse { target_nick, sent_key } if target_nick == &originator_nick => {
                                     *state_guard = ClientState::InPrivateChat { with_nick: originator_nick.clone(), shared_key: sent_key.clone() };
-                                    if writer_guard.write_all(format!("{} Пользователь '{}' принял ваш запрос на личный чат. Вы теперь в приватном чате.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
-                                    println!("{} '{}' обновил статус: приватный чат с '{}'", "ИНФО:".cyan(), nickname_write, originator_nick);
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                    if writer_guard.write_all(format!("{} Пользователь '{}' принял ваш запрос на личный чат. Вы теперь в приватном чате.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); }
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' обновил статус: приватный чат с '{}'", nickname_write, originator_nick), Color::Cyan).await?;
                                 }
                                 _ => {
-                                    eprintln!("{} Неожиданный PRIVATE_CHAT_ACCEPTED от {} для {}", "ОШИБКА СЕРВЕРА:".red(), originator_nick, nickname_write);
-                                    if writer_guard.write_all(format!("Пользователь '{}' принял ваш запрос, но вы не находитесь в ожидающем состоянии. Возможно, чат уже начат или отменен.\n", originator_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    log_message("Error", &format!("Undefined chat accept от {} для {}", originator_nick, nickname_write), Color::Red).await?;
+                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                    if writer_guard.write_all(format!("Пользователь '{}' принял ваш запрос, но вы не находитесь в ожидающем состоянии. Возможно, чат уже начат или отменен.\n", originator_nick).as_bytes()).await.is_err() { break Ok(()); }
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
                                 }
                             }
                         }
                         "PRIVATE_CHAT_REJECTED" => {
                             let originator_nick = args.to_string();
+                            let mut state_guard = client_state_write.lock().await; // Захватываем мьютекс
                             match &mut *state_guard {
                                 ClientState::WaitingForPrivateChatResponse { target_nick, sent_key: _ } if target_nick == &originator_nick => {
                                     *state_guard = ClientState::PublicChat;
-                                    if writer_guard.write_all(format!("{} Пользователь '{}' отклонил ваш запрос на личный чат. Вы возвращены в общий чат.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
-                                    println!("{} '{}' отклонил приватный чат от '{}'", "ИНФО:".cyan(), originator_nick, nickname_write);
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                    if writer_guard.write_all(format!("{} Пользователь '{}' отклонил ваш запрос на личный чат. Вы возвращены в общий чат.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); }
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' отклонил приватный чат от '{}'", originator_nick, nickname_write), Color::Cyan).await?;
                                 }
                                 _ => {
-                                    eprintln!("{} Неожиданный PRIVATE_CHAT_REJECTED от {} для {}", "ОШИБКА СЕРВЕРА:".red(), originator_nick, nickname_write);
-                                    if writer_guard.write_all(format!("Пользователь '{}' отклонил ваш запрос, но вы не находитесь в ожидающем состоянии. Возможно, чат уже начат или отменен.\n", originator_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    log_message("Error", &format!("Undefined chat reject от {} для {}", originator_nick, nickname_write), Color::Red).await?;
+                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                    if writer_guard.write_all(format!("Пользователь '{}' отклонил ваш запрос, но вы не находитесь в ожидающем состоянии. Возможно, чат уже начат или отменен.\n", originator_nick).as_bytes()).await.is_err() { break Ok(()); }
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
                                 }
                             }
                         }
                         "PRIVATE_CHAT_ENDED" => {
                             let originator_nick = args.to_string();
+                            let mut state_guard = client_state_write.lock().await; // Захватываем мьютекс
                             match &mut *state_guard {
                                 ClientState::InPrivateChat { with_nick, shared_key: _ } if with_nick == &originator_nick => {
                                     *state_guard = ClientState::PublicChat;
-                                    if writer_guard.write_all(format!("{} Пользователь '{}' вышел из личного чата. Вы возвращены в общий чат.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
-                                    println!("{} '{}' вышел из приватного чата с '{}'", "ИНФО:".cyan(), originator_nick, nickname_write);
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                    if writer_guard.write_all(format!("{} Пользователь '{}' вышел из личного чата. Вы возвращены в общий чат.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); }
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' вышел из приватного чата с '{}'", originator_nick, nickname_write), Color::Cyan).await?;
                                 }
                                 _ => {
-                                    eprintln!("{} Неожиданный PRIVATE_CHAT_ENDED от {} для {}", "ОШИБКА СЕРВЕРА:".red(), originator_nick, nickname_write);
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    log_message("Error", &format!("Undefined chat end от {} для {}", originator_nick, nickname_write), Color::Red).await?;
                                 }
                             }
                         }
                         "PRIVATE_CHAT_BUSY" => {
                             let originator_nick = args.to_string();
+                            let mut state_guard = client_state_write.lock().await; // Захватываем мьютекс
                             match &mut *state_guard {
                                 ClientState::WaitingForPrivateChatResponse { target_nick, sent_key: _ } if target_nick == &originator_nick => {
                                     *state_guard = ClientState::PublicChat;
-                                    if writer_guard.write_all(format!("{} Пользователь '{}' занят или уже в другом приватном чате. Вы возвращены в общий чат.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
-                                    println!("{} '{}' занят для приватного чата с '{}'", "ИНФО:".cyan(), originator_nick, nickname_write);
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                    if writer_guard.write_all(format!("{} Пользователь '{}' занят или уже в другом приватном чате. Вы возвращены в общий чат.\n", "ИНФО:".green(), originator_nick).as_bytes()).await.is_err() { break Ok(()); }
+                                    writer_guard.flush().await?;
+                                    drop(writer_guard); // Освобождаем мьютекс
+                                    log_message("Private chat", &format!("'{}' занят для приватного чата с '{}'", originator_nick, nickname_write), Color::Cyan).await?;
                                 }
                                 _ => {
-                                    eprintln!("{} Неожиданный PRIVATE_CHAT_BUSY от {} для {}", "ОШИБКА СЕРВЕРА:".red(), originator_nick, nickname_write);
+                                    drop(state_guard); // Освобождаем мьютекс
+                                    log_message("Error", &format!("Undefined chat busy от {} для {}", originator_nick, nickname_write), Color::Red).await?;
                                 }
                             }
                         }
@@ -646,67 +845,98 @@ async fn handle_client(
                                 let sender_nick = msg_parts[0];
                                 let nonce_hex = msg_parts[1];
                                 let ciphertext_hex = msg_parts[2];
-                                
+
+                                let mut state_guard = client_state_write.lock().await; // Захватываем мьютекс
                                 match &mut *state_guard {
                                     ClientState::InPrivateChat { with_nick, shared_key } if with_nick == sender_nick => {
+                                        let shared_key_clone = shared_key.clone(); // Клонируем shared_key для использования после освобождения мьютекса
+                                        drop(state_guard); // Освобождаем мьютекс
+
                                         match hex::decode(nonce_hex) {
                                             Ok(nonce_bytes) if nonce_bytes.len() == 12 => { // Проверяем длину nonce
                                                 match hex::decode(ciphertext_hex) {
                                                     Ok(ciphertext_bytes) => {
-                                                        let cipher = Aes256Gcm::new_from_slice(shared_key).expect("Key length is 32 bytes");
+                                                        let cipher = Aes256Gcm::new_from_slice(&shared_key_clone).expect("Key length is 32 bytes");
                                                         let nonce = Nonce::from_slice(&nonce_bytes); // Создаем Nonce из среза
                                                         match cipher.decrypt(nonce, ciphertext_bytes.as_ref()) {
                                                             Ok(plaintext_bytes) => {
                                                                 if let Ok(plaintext_msg) = String::from_utf8(plaintext_bytes) {
-                                                                    if writer_guard.write_all(format!("[ЛС от {}]: {}\n", sender_nick.cyan(), plaintext_msg).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
-                                                                    println!("{} '{}' получил зашифрованное ЛС от '{}'", "ИНФО:".cyan(), nickname_write, sender_nick);
+                                                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                                                    if writer_guard.write_all(format!("[ЛС от {}]: {}\n", sender_nick.cyan(), plaintext_msg).as_bytes()).await.is_err() { break Ok(()); }
+                                                                    writer_guard.flush().await?;
+                                                                    drop(writer_guard); // Освобождаем мьютекс
+                                                                    log_message("Private", &format!("'{}' получил зашифрованное ЛС от '{}'", nickname_write, sender_nick), Color::Cyan).await?;
                                                                 } else {
-                                                                    eprintln!("{} Ошибка декодирования UTF-8 для {}: {}", "ОШИБКА:".red(), nickname_write, sender_nick);
-                                                                    if writer_guard.write_all("Получено некорректное UTF-8 сообщение (дешифровка).\n".as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                                                    let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                                                    writer_guard.write_all("Получено некорректное UTF-8 сообщение (дешифровка).\n".as_bytes()).await?;
+                                                                    writer_guard.flush().await?;
+                                                                    drop(writer_guard); // Освобождаем мьютекс
+                                                                    log_message("Error", &format!("Ошибка декодирования UTF-8 для {}: {}", nickname_write, sender_nick), Color::Red).await?;
                                                                 }
                                                             },
                                                             Err(e) => {
-                                                                eprintln!("{} Ошибка дешифрования для {}: {:?}", "ОШИБКА:".red(), nickname_write, e);
-                                                                if writer_guard.write_all("Ошибка дешифрования сообщения. Возможно, ключ неверный.\n".as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                                                let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                                                writer_guard.write_all("Ошибка дешифрования сообщения. Возможно, ключ неверный.\n".as_bytes()).await?;
+                                                                writer_guard.flush().await?;
+                                                                drop(writer_guard); // Освобождаем мьютекс
+                                                                log_message("Error", &format!("Ошибка дешифрования для {}: {:?}", nickname_write, e), Color::Red).await?;
                                                             }
                                                         }
                                                     },
                                                     Err(e) => {
-                                                        eprintln!("{} Ошибка декодирования hex для ciphertext: {:?}", "ОШИБКА:".red(), e);
-                                                        if writer_guard.write_all("Получено некорректное зашифрованное сообщение (ошибка hex-декодирования).\n".as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                                        let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                                        writer_guard.write_all("Получено некорректное зашифрованное сообщение (ошибка hex-декодирования).\n".as_bytes()).await?;
+                                                        writer_guard.flush().await?;
+                                                        drop(writer_guard); // Освобождаем мьютекс
+                                                        log_message("Error", &format!("Ошибка декодирования hex для ciphertext: {:?}", e), Color::Red).await?;
                                                     }
                                                 }
                                             },
                                             _ => { // Некорректная длина nonce
-                                                eprintln!("{} Ошибка декодирования hex для nonce или неверная длина: {:?}", "ОШИБКА:".red(), nonce_hex);
-                                                if writer_guard.write_all("Получено некорректное зашифрованное сообщение (ошибка hex-декодирования nonce или неверная длина).\n".as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                                let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                                writer_guard.write_all("Получено некорректное зашифрованное сообщение (ошибка hex-декодирования nonce или неверная длина).\n".as_bytes()).await?;
+                                                writer_guard.flush().await?;
+                                                drop(writer_guard); // Освобождаем мьютекс
+                                                log_message("Error", &format!("Ошибка декодирования hex для nonce или неверная длина: {:?}", nonce_hex), Color::Red).await?;
                                             }
                                         }
                                     },
                                     _ => { // Клиент не в приватном чате или не с тем партнером
-                                        eprintln!("{} Получено ENCRYPTED_PRIVATE_MSG от {} для {} в некорректном состоянии.", "ОШИБКА СЕРВЕРА:".red(), sender_nick, nickname_write);
-                                        if writer_guard.write_all(format!("Получено зашифрованное сообщение от '{}', но вы не находитесь в приватном чате с ним.\n", sender_nick).as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                        drop(state_guard); // Освобождаем мьютекс
+                                        let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                        writer_guard.write_all(format!("Получено зашифрованное сообщение от '{}', но вы не находитесь в приватном чате с ним.\n", sender_nick).as_bytes()).await?;
+                                        writer_guard.flush().await?;
+                                        drop(writer_guard); // Освобождаем мьютекс
+                                        log_message("Error", &format!("Получено ENCRYPTED_PRIVATE_MSG от {} для {} в некорректном состоянии.", sender_nick, nickname_write), Color::Red).await?;
                                     }
                                 }
                             } else {
-                                eprintln!("{} Некорректный формат ENCRYPTED_PRIVATE_MSG: {}", "ОШИБКА СЕРВЕРА:".red(), msg_str);
-                                if writer_guard.write_all("Получено некорректное зашифрованное сообщение.\n".as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                                let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                                if writer_guard.write_all("Получено некорректное зашифрованное сообщение.\n".as_bytes()).await.is_err() { break Ok(()); }
+                                writer_guard.flush().await?;
+                                drop(writer_guard); // Освобождаем мьютекс
+                                log_message("Error", &format!("Некорректный формат ENCRYPTED_PRIVATE_MSG: {}", msg_str), Color::Red).await?;
                             }
                         }
-                        _ => { eprintln!("{} Неизвестная системная команда: {}", "ОШИБКА СЕРВЕРА:".red(), command); }
+                        _ => { log_message("Error", &format!("Неизвестная системная команда: {}", command), Color::Red).await?; }
                     }
                 } else { // Обычное сообщение (не системное)
-                    let display_message = match &*state_guard {
-                        ClientState::InPrivateChat {..} => !msg_str.starts_with(&format!("{} ", "Всем".blue())),
-                        _ => true,
-                    };
+                    let display_message;
+                    {
+                        let state_guard = client_state_write.lock().await; // Захватываем мьютекс
+                        display_message = match &*state_guard {
+                            ClientState::InPrivateChat {..} => !msg_str.starts_with(&format!("{} ", "Всем".blue())),
+                            _ => true,
+                        };
+                    } // state_guard автоматически освобождается здесь
+
                     if display_message {
-                        if writer_guard.write_all(msg_str.as_bytes()).await.is_err() { break Ok(()); } // Corrected break
+                        let mut writer_guard = writer_arc_for_task.lock().await; // Захватываем мьютекс
+                        if writer_guard.write_all(msg_str.as_bytes()).await.is_err() { break Ok(()); }
+                        writer_guard.flush().await?;
+                        drop(writer_guard); // Освобождаем мьютекс
                     }
                 }
-
-                drop(state_guard); // Явно освобождаем guard
-                if writer_guard.flush().await.is_err() { break Ok(()); } // Corrected break
             };
             res // Возвращаем результат выполнения задачи
         }
@@ -715,12 +945,12 @@ async fn handle_client(
     // Ожидание завершения одной из задач (read_task или write_task)
     tokio::select! {
         res = read_task => {
-            if let Err(e) = res { eprintln!("{} Ошибка в задаче чтения для {}: {:?}", "СИСТЕМА:".magenta(), nickname, e); }
-            println!("{} {}: read_task завершилась в select.", "ИНФО:".cyan(), nickname);
+            if let Err(e) = res { log_message("SYSTEM", &format!("Ошибка в задаче чтения для {}: {:?}", nickname, e), Color::Magenta).await?; }
+            log_message("info", &format!("{}: read_task завершилась в select.", nickname), Color::Cyan).await?;
         },
         res = write_task => {
-            if let Err(e) = res { eprintln!("{} Ошибка в задаче записи для {}: {:?}", "СИСТЕМА:".magenta(), nickname, e); }
-            println!("{} {}: write_task завершилась в select.", "ИНФО:".cyan(), nickname);
+            if let Err(e) = res { log_message("SYSTEM", &format!("Ошибка в задаче записи для {}: {:?}", nickname, e), Color::Magenta).await?; }
+            log_message("info", &format!("{}: write_task завершилась в select.", nickname), Color::Cyan).await?;
         },
     }
 
@@ -729,13 +959,13 @@ async fn handle_client(
     {
         let mut users_guard = connected_users.lock().await;
         users_guard.remove(&nickname); // Удаляем клиента из списка подключенных
-        println!("{}", format!("Пользователь '{}' отключился. В сети: {}", nickname, users_guard.len()).yellow());
+        log_message("Client", &format!("Пользователь '{}' отключился. В сети: {}", nickname, users_guard.len()), Color::Yellow).await?;
     }
 
     // Если клиент был в приватном чате, уведомляем партнера о выходе
     if let ClientState::InPrivateChat { with_nick, shared_key: _ } = final_client_state {
         let _ = send_to_user(&connected_users, &with_nick, format!("SYSTEM:PRIVATE_CHAT_ENDED:{}", nickname)).await;
-        println!("{} Уведомлен '{}' о выходе '{}' из их приватного чата", "ИНФО:".cyan(), with_nick, nickname);
+        log_message("info", &format!("Уведомлен '{}' о выходе '{}' из их приватного чата", with_nick, nickname), Color::Cyan).await?;
     }
 
     // Широковещательное сообщение о выходе клиента
